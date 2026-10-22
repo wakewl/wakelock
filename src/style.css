@@ -1,0 +1,39 @@
+/* Colours come from colors.css (or the defaults in surface.rs). */
+
+window.wakelock {
+    background: @bg;
+    font-family: "JetBrains Mono";
+    font-size: 15px;
+    color: @fg;
+}
+
+.backdrop-dim { background: alpha(@bg, 0.55); }
+
+.clock { font-size: 84px; }
+.date { font-size: 17px; color: @fg_muted; }
+
+.field {
+    min-width: 328px;
+    min-height: 42px;
+    padding: 0 13px;
+    background: @bg_alt;
+    border: 3px solid @shadow;
+    border-radius: 12px;
+    box-shadow: 5px 5px 0 0 alpha(@shadow, 0.85);
+}
+.field.filled { border-color: @accent; }
+.field.failed { border-color: @urgent; }
+
+text {
+    all: unset;
+    caret-color: @fg;
+    color: @fg;
+}
+text placeholder { color: @fg_muted; }
+text selection { background: @accent; color: @bg; }
+
+.message {
+    font-size: 13px;
+    color: @fg_muted;
+}
+.message.failed { color: @urgent; }
