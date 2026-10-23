@@ -101,6 +101,7 @@ extern "C" fn converse(
     PAM_SUCCESS
 }
 
+#[derive(Debug)]
 pub struct Outcome {
     pub success: bool,
     pub notice: String,

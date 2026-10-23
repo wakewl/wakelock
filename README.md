@@ -1,8 +1,7 @@
 # wakelock
 
 A lock screen for wlroots compositors such as [dwl](https://github.com/joeyshi12/dwl), written
-in Rust with GTK 4 and gtk4-session-lock (ext-session-lock-v1). It shows a clock, the date and a
-password field over a blurred screenshot of each monitor.
+in Rust with GTK 4 (through Relm4) and gtk4-session-lock (ext-session-lock-v1).
 
 ```sh
 wakelock [--pam-service NAME] [--pam-dir DIR]

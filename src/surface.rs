@@ -1,12 +1,9 @@
 // The lock surface. Prints "locked" once the compositor confirms the lock.
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-    time::Duration,
-};
+use std::time::Duration;
 
 use gtk::{gdk, glib, prelude::*};
 use gtk4_session_lock::Instance;
+use relm4::{RelmWidgetExt, prelude::*};
 
 use crate::{Options, pam, ppm, snapshot_dir};
 
@@ -20,26 +17,6 @@ const DEFAULT_COLORS: &str = "
 @define-color urgent #f4d06f;
 @define-color shadow #05090f;
 ";
-
-struct Screen {
-    clock: gtk::Label,
-    date: gtk::Label,
-    field: gtk::Box,
-    input: gtk::Text,
-    message: gtk::Label,
-}
-
-struct Lock {
-    options: Options,
-    user: String,
-    screens: RefCell<Vec<Screen>>,
-    checking: Cell<bool>,
-    failed: Cell<bool>,
-    message: RefCell<String>,
-    /// Set while copying text between screens, so the copies do not echo
-    syncing: Cell<bool>,
-    instance: Instance,
-}
 
 fn config_dir() -> std::path::PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
@@ -137,51 +114,25 @@ pub fn run(options: &Options, snapshot: bool) -> std::process::ExitCode {
     }
 
     let main_loop = glib::MainLoop::new(None, false);
-    let lock = Rc::new(Lock {
-        options: Options { pam_service: options.pam_service.clone(), pam_dir: options.pam_dir.clone() },
-        user: username(),
-        screens: RefCell::new(Vec::new()),
-        checking: Cell::new(false),
-        failed: Cell::new(false),
-        message: RefCell::new(String::new()),
-        syncing: Cell::new(false),
-        instance: Instance::new(),
-    });
-
-    let weak = Rc::downgrade(&lock);
-    lock.instance.connect_monitor(move |instance, monitor| {
-        if let Some(lock) = weak.upgrade() {
-            let window = lock.build_window(monitor);
-            instance.assign_window_to_monitor(&window, monitor);
-            window.present();
-        }
-    });
-    lock.instance.connect_locked(|_| {
+    let instance = Instance::new();
+    instance.connect_locked(|_| {
         let mut out = std::io::stdout();
         let _ = std::io::Write::write_all(&mut out, b"locked\n");
         let _ = std::io::Write::flush(&mut out);
     });
-    lock.instance.connect_failed(|_| {
+    instance.connect_failed(|_| {
         eprintln!("wakelock: the compositor refused the lock");
         std::process::exit(2);
     });
     let quit = main_loop.clone();
-    lock.instance.connect_unlocked(move |_| quit.quit());
+    instance.connect_unlocked(move |_| quit.quit());
+    let options = Options { pam_service: options.pam_service.clone(), pam_dir: options.pam_dir.clone() };
+    let _lock = Lock::builder().launch((options, instance.clone())).detach();
 
-    if !lock.instance.lock() {
+    if !instance.lock() {
         eprintln!("wakelock: cannot lock the session");
         return std::process::ExitCode::from(2);
     }
-
-    let weak = Rc::downgrade(&lock);
-    glib::timeout_add_local(Duration::from_secs(1), move || match weak.upgrade() {
-        Some(lock) => {
-            lock.update_clock();
-            glib::ControlFlow::Continue
-        }
-        None => glib::ControlFlow::Break,
-    });
-
     main_loop.run();
     if let Some(display) = gdk::Display::default() {
         display.sync();
@@ -189,194 +140,264 @@ pub fn run(options: &Options, snapshot: bool) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-impl Lock {
-    fn build_window(self: &Rc<Self>, monitor: &gdk::Monitor) -> gtk::Window {
-        let window = gtk::Window::new();
-        window.add_css_class("wakelock");
-        window.set_decorated(false);
+#[derive(Debug, Clone, Default, PartialEq)]
+struct View {
+    time: String,
+    date: String,
+    filled: bool,
+    failed: bool,
+    checking: bool,
+    message: String,
+}
 
-        let overlay = gtk::Overlay::new();
-        let picture = gtk::Picture::new();
-        picture.set_content_fit(gtk::ContentFit::Cover);
-        picture.set_can_shrink(true);
-        picture.add_css_class("backdrop-image");
-        if let Some(connector) = monitor.connector() {
-            let path = snapshot_dir().join(format!("{connector}.ppm"));
-            if let Some(texture) = load_snapshot(&path) {
-                picture.set_paintable(Some(&texture));
+struct Lock {
+    options: Options,
+    user: String,
+    instance: Instance,
+    /// One buffer for every screen's field, so they stay in sync
+    password: gtk::EntryBuffer,
+    screens: Vec<Controller<Screen>>,
+    failed: bool,
+    checking: bool,
+    message: String,
+    view: View,
+}
+
+#[derive(Debug)]
+enum LockMsg {
+    Monitor(gdk::Monitor),
+    Tick,
+    Changed,
+    Submit,
+    Clear,
+    Checked(pam::Outcome),
+}
+
+impl Component for Lock {
+    type Init = (Options, Instance);
+    type Input = LockMsg;
+    type Output = ();
+    type CommandOutput = ();
+    type Root = ();
+    type Widgets = ();
+
+    fn init_root() {}
+
+    fn init((options, instance): Self::Init, _: (), sender: ComponentSender<Self>) -> ComponentParts<Self> {
+        let password = gtk::EntryBuffer::default();
+        let changed = sender.clone();
+        password.connect_text_notify(move |_| changed.input(LockMsg::Changed));
+        let monitors = sender.clone();
+        instance.connect_monitor(move |_, monitor| monitors.input(LockMsg::Monitor(monitor.clone())));
+        glib::timeout_add_local(Duration::from_secs(1), move || {
+            sender.input(LockMsg::Tick);
+            glib::ControlFlow::Continue
+        });
+        let mut lock = Lock {
+            options,
+            user: username(),
+            instance,
+            password,
+            screens: Vec::new(),
+            failed: false,
+            checking: false,
+            message: String::new(),
+            view: View::default(),
+        };
+        lock.refresh();
+        ComponentParts { model: lock, widgets: () }
+    }
+
+    fn update(&mut self, msg: LockMsg, sender: ComponentSender<Self>, _: &()) {
+        match msg {
+            LockMsg::Monitor(monitor) => {
+                let screen = Screen::builder()
+                    .launch((monitor.clone(), self.password.clone(), self.view.clone()))
+                    .forward(sender.input_sender(), |msg| msg);
+                self.instance.assign_window_to_monitor(screen.widget(), &monitor);
+                screen.widget().present();
+                self.screens.push(screen);
             }
-        }
-        overlay.set_child(Some(&picture));
-        let dim = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        dim.add_css_class("backdrop-dim");
-        overlay.add_overlay(&dim);
-
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        column.set_halign(gtk::Align::Center);
-        column.set_valign(gtk::Align::Center);
-        let clock = gtk::Label::new(None);
-        clock.add_css_class("clock");
-        column.append(&clock);
-        let date = gtk::Label::new(None);
-        date.add_css_class("date");
-        column.append(&date);
-        let gap = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        gap.set_size_request(1, 36);
-        column.append(&gap);
-
-        let field = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        field.add_css_class("field");
-        field.set_halign(gtk::Align::Center);
-        let input = gtk::Text::new();
-        input.set_hexpand(true);
-        input.set_valign(gtk::Align::Center);
-        input.set_visibility(false);
-        input.set_invisible_char('•');
-        input.set_placeholder_text(Some("Password"));
-        field.append(&input);
-        column.append(&field);
-
-        let message = gtk::Label::new(None);
-        message.add_css_class("message");
-        message.set_wrap(true);
-        message.set_justify(gtk::Justification::Center);
-        message.set_max_width_chars(1);
-        message.set_size_request(320, -1);
-        message.set_halign(gtk::Align::Center);
-        column.append(&message);
-        overlay.add_overlay(&column);
-        window.set_child(Some(&overlay));
-
-        let weak = Rc::downgrade(self);
-        input.connect_changed(move |input| {
-            let Some(lock) = weak.upgrade() else { return };
-            if lock.syncing.get() {
-                return;
-            }
-            lock.syncing.set(true);
-            let text = input.text();
-            for screen in lock.screens.borrow().iter() {
-                if &screen.input != input {
-                    screen.input.set_text(&text);
+            LockMsg::Tick => {}
+            LockMsg::Changed => {
+                if !self.password.text().is_empty() {
+                    self.failed = false;
                 }
             }
-            lock.syncing.set(false);
-            if !text.is_empty() {
-                lock.failed.set(false);
-            }
-            lock.update();
-        });
-        let keys = gtk::EventControllerKey::new();
-        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let weak = Rc::downgrade(self);
-        keys.connect_key_pressed(move |_, key, _, _| {
-            let Some(lock) = weak.upgrade() else { return glib::Propagation::Proceed };
-            match key {
-                gdk::Key::Return | gdk::Key::KP_Enter => lock.submit(),
-                gdk::Key::Escape => lock.set_password(""),
-                _ => return glib::Propagation::Proceed,
-            }
-            glib::Propagation::Stop
-        });
-        window.add_controller(keys);
-
-        self.screens.borrow_mut().push(Screen { clock, date, field, input: input.clone(), message });
-        let text = self.screens.borrow().first().map(|s| s.input.text()).unwrap_or_default();
-        self.syncing.set(true);
-        input.set_text(&text);
-        self.syncing.set(false);
-        self.update_clock();
-        self.update();
-        input.grab_focus();
-        window
-    }
-
-    fn password(&self) -> String {
-        self.screens.borrow().first().map(|s| s.input.text().to_string()).unwrap_or_default()
-    }
-
-    fn set_password(&self, text: &str) {
-        self.syncing.set(true);
-        for screen in self.screens.borrow().iter() {
-            screen.input.set_text(text);
-        }
-        self.syncing.set(false);
-        self.update();
-    }
-
-    fn update_clock(&self) {
-        let Ok(now) = glib::DateTime::now_local() else { return };
-        let time = now.format("%H:%M").map(|s| s.to_string()).unwrap_or_default();
-        let date = now.format("%A, %B %-e").map(|s| s.to_string()).unwrap_or_default();
-        for screen in self.screens.borrow().iter() {
-            if screen.clock.text() != time {
-                screen.clock.set_text(&time);
-            }
-            if screen.date.text() != date {
-                screen.date.set_text(&date);
-            }
-        }
-    }
-
-    fn update(&self) {
-        let filled = !self.password().is_empty();
-        let failed = self.failed.get();
-        let checking = self.checking.get();
-        let message = if checking { "Checking...".to_owned() } else { self.message.borrow().clone() };
-        for screen in self.screens.borrow().iter() {
-            for (class, on) in [("filled", filled && !failed), ("failed", failed)] {
-                if on {
-                    screen.field.add_css_class(class);
-                } else {
-                    screen.field.remove_css_class(class);
+            LockMsg::Submit => self.submit(&sender),
+            LockMsg::Clear => self.password.set_text(""),
+            LockMsg::Checked(outcome) => {
+                self.checking = false;
+                if outcome.success {
+                    self.instance.unlock();
+                    return;
                 }
+                self.failed = true;
+                self.message = match outcome.error {
+                    Some(error) => format!("Could not check the password ({error})"),
+                    None if !outcome.notice.is_empty() => outcome.notice,
+                    None => "Wrong password".to_owned(),
+                };
+                self.password.set_text("");
             }
-            if failed {
-                screen.message.add_css_class("failed");
-            } else {
-                screen.message.remove_css_class("failed");
-            }
-            screen.message.set_text(&message);
-            screen.message.set_visible(!message.is_empty());
-            screen.input.set_editable(!checking);
         }
-    }
-
-    fn submit(self: &Rc<Self>) {
-        let password = self.password();
-        if self.checking.get() || password.is_empty() {
-            return;
-        }
-        self.checking.set(true);
-        self.failed.set(false);
-        self.message.replace(String::new());
-        self.update();
-
-        let (sender, receiver) = async_channel::bounded(1);
-        let service = self.options.pam_service.clone();
-        let dir = self.options.pam_dir.clone();
-        let user = self.user.clone();
-        std::thread::spawn(move || {
-            let outcome = pam::authenticate(&service, dir.as_deref(), &user, password);
-            let _ = sender.send_blocking(outcome);
-        });
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let Ok(outcome) = receiver.recv().await else { return };
-            let Some(lock) = weak.upgrade() else { return };
-            lock.checking.set(false);
-            if outcome.success {
-                lock.instance.unlock();
-                return;
-            }
-            lock.failed.set(true);
-            let message = match outcome.error {
-                Some(error) => format!("Could not check the password ({error})"),
-                None if !outcome.notice.is_empty() => outcome.notice,
-                None => "Wrong password".to_owned(),
-            };
-            lock.message.replace(message);
-            lock.set_password("");
-        });
+        self.refresh();
     }
 }
+
+impl Lock {
+    fn submit(&mut self, sender: &ComponentSender<Self>) {
+        let password = self.password.text().to_string();
+        if self.checking || password.is_empty() {
+            return;
+        }
+        self.checking = true;
+        self.failed = false;
+        self.message.clear();
+        let (service, dir, user) = (self.options.pam_service.clone(), self.options.pam_dir.clone(), self.user.clone());
+        let (outcome, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = outcome.send_blocking(pam::authenticate(&service, dir.as_deref(), &user, password));
+        });
+        let sender = sender.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(outcome) = receiver.recv().await {
+                sender.input(LockMsg::Checked(outcome));
+            }
+        });
+    }
+
+    fn refresh(&mut self) {
+        let now = glib::DateTime::now_local().ok();
+        let format = |f: &str| now.as_ref().and_then(|n| n.format(f).ok()).map(|s| s.to_string()).unwrap_or_default();
+        let view = View {
+            time: format("%H:%M"),
+            date: format("%A, %B %-e"),
+            filled: !self.password.text().is_empty(),
+            failed: self.failed,
+            checking: self.checking,
+            message: if self.checking { "Checking...".to_owned() } else { self.message.clone() },
+        };
+        if view != self.view {
+            self.view = view;
+            for screen in &self.screens {
+                screen.emit(self.view.clone());
+            }
+        }
+    }
+}
+
+struct Screen {
+    password: gtk::EntryBuffer,
+    view: View,
+}
+
+#[relm4::component]
+impl SimpleComponent for Screen {
+    type Init = (gdk::Monitor, gtk::EntryBuffer, View);
+    type Input = View;
+    type Output = LockMsg;
+
+    view! {
+        gtk::Window {
+            add_css_class: "wakelock",
+            set_decorated: false,
+            add_controller = gtk::EventControllerKey {
+                set_propagation_phase: gtk::PropagationPhase::Capture,
+                connect_key_pressed[sender] => move |_, key, _, _| {
+                    let msg = match key {
+                        gdk::Key::Return | gdk::Key::KP_Enter => LockMsg::Submit,
+                        gdk::Key::Escape => LockMsg::Clear,
+                        _ => return glib::Propagation::Proceed,
+                    };
+                    let _ = sender.output(msg);
+                    glib::Propagation::Stop
+                },
+            },
+
+            gtk::Overlay {
+                gtk::Picture {
+                    set_content_fit: gtk::ContentFit::Cover,
+                    set_can_shrink: true,
+                    add_css_class: "backdrop-image",
+                    set_paintable: snapshot.as_ref(),
+                },
+                add_overlay = &gtk::Box {
+                    add_css_class: "backdrop-dim",
+                },
+                add_overlay = &gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 12,
+                    set_halign: gtk::Align::Center,
+                    set_valign: gtk::Align::Center,
+
+                    gtk::Label {
+                        add_css_class: "clock",
+                        #[watch]
+                        set_label: &model.view.time,
+                    },
+                    gtk::Label {
+                        add_css_class: "date",
+                        #[watch]
+                        set_label: &model.view.date,
+                    },
+                    gtk::Box {
+                        set_size_request: (1, 36),
+                    },
+                    gtk::Box {
+                        add_css_class: "field",
+                        set_halign: gtk::Align::Center,
+                        #[watch]
+                        set_class_active: ("filled", model.view.filled && !model.view.failed),
+                        #[watch]
+                        set_class_active: ("failed", model.view.failed),
+
+                        #[name = "input"]
+                        gtk::Text {
+                            set_buffer: &model.password,
+                            set_hexpand: true,
+                            set_valign: gtk::Align::Center,
+                            set_visibility: false,
+                            set_invisible_char: '•',
+                            set_placeholder_text: Some("Password"),
+                            #[watch]
+                            set_editable: !model.view.checking,
+                        },
+                    },
+                    gtk::Label {
+                        add_css_class: "message",
+                        set_wrap: true,
+                        set_justify: gtk::Justification::Center,
+                        set_max_width_chars: 1,
+                        set_size_request: (320, -1),
+                        set_halign: gtk::Align::Center,
+                        #[watch]
+                        set_class_active: ("failed", model.view.failed),
+                        #[watch]
+                        set_label: &model.view.message,
+                        #[watch]
+                        set_visible: !model.view.message.is_empty(),
+                    },
+                },
+            },
+        }
+    }
+
+    fn init(
+        (monitor, password, view): Self::Init,
+        root: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let snapshot =
+            monitor.connector().and_then(|c| load_snapshot(&snapshot_dir().join(format!("{c}.ppm"))));
+        let model = Screen { password, view };
+        let widgets = view_output!();
+        widgets.input.grab_focus();
+        ComponentParts { model, widgets }
+    }
+
+    fn update(&mut self, view: View, _sender: ComponentSender<Self>) {
+        self.view = view;
+    }
+}
+
